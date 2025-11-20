@@ -1,7 +1,3 @@
 # Ignore rendered video outputs
-conan_final.mp4
-conan_story_cut.mp4
-conan_v2_deepseek.mp4
-conan_v3_with_ending.mp4
-conan_mystery_cut.mp4
-conan_story_highlights.mp4
+/video_clips/*
+/p_tts_output/*
