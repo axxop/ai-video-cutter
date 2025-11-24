@@ -115,10 +115,11 @@ class VideoClipFinder:
             print(f"  ⚠ 行号范围 [{line_start_adjusted}-{line_end_adjusted}] (原始: [{line_start}-{line_end}], 已调整-2) 内没有找到字幕")
             return None
         
-        # 构建上下文
+        # 构建上下文 - 明确显示每行的时间长度
         context = []
         for sub in range_subs:
-            context.append(f"[{sub['index']}] {sub['start_time']:.2f}s-{sub['end_time']:.2f}s: {sub['text']}")
+            sub_duration = sub['end_time'] - sub['start_time']
+            context.append(f"[行{sub['index']}] {sub['start_time']:.2f}s-{sub['end_time']:.2f}s (时长{sub_duration:.2f}s): {sub['text']}")
         
         context_text = '\n'.join(context)
         
@@ -135,23 +136,27 @@ class VideoClipFinder:
 旁白文本长度: {text_length} 字
 **实际音频时长: {duration:.2f} 秒** ← 这是真实的TTS音频长度！
 
-可选的视频片段（原始字幕）:
+**⏱️ 要求的总视频时长: {min_duration:.1f}s 到 {max_duration:.1f}s**
+
+可选的视频片段（原始字幕，每行都标注了时长）:
 {context_text}
 
 **🚨 核心要求（必须严格遵守）**:
-1. **所有片段总时长必须在 {min_duration:.1f}s 到 {max_duration:.1f}s 之间**
-   - 最小: {min_duration:.1f}秒（音频 {duration:.2f}s + 0.5s缓冲）
-   - 最大: {max_duration:.1f}秒（音频 {duration:.2f}s + 3.0s）
-2. **如果选择多个片段拼接，请精确计算总时长，确保在范围内！**
-3. **宁可选长，不能选短**（短了解说会卡顿）
-4. **不要选择过长的片段组合**（超过 {max_duration:.1f}s 会被截断浪费）
+1. **根据每个片段的时长（end_time - start_time）精确计算总时长**
+2. **总时长必须在 {min_duration:.1f}s 到 {max_duration:.1f}s 之间**
+3. **选择片段时，先用时间计算，不要只看行号！**
+4. **示例计算**: 
+   - 选择 [行10-12]: 111.2s - 103.1s = 8.1s
+   - 选择 [行73-79]: 331.5s - 312.6s = 18.9s
+   - 总时长: 8.1s + 18.9s = 27.0s ❌ 超过 {max_duration:.1f}s！
+   - 正确做法: 只选1个片段，或调整范围使总时长符合要求
 
 选择策略:
+- **第一步**: 先计算需要多少秒视频（{min_duration:.1f}s - {max_duration:.1f}s）
+- **第二步**: 查看每个字幕的时长（已标注），累加选择
+- **第三步**: 确保 total_duration 在范围内再返回
 - 优先选择内容相关且画面精彩的片段
-- 如果单个片段不够长，**选择多个片段拼接**
-- **多片段时，先计算每个片段时长，确保总和在 [{min_duration:.1f}s, {max_duration:.1f}s] 范围内**
-- 片段内容要与旁白意思相关
-- 每段内部必须连续（如 [10-15]），但段与段之间可以跳跃（如 [10-15] + [25-30]）
+- 可以选择多个不连续片段，但必须精确控制总时长
 
 请以 JSON 格式返回，只返回 JSON，不要其他内容:
 {{
@@ -159,20 +164,20 @@ class VideoClipFinder:
     {{
       "start_line": <起始行号>,
       "end_line": <结束行号>,
-      "start_time": <开始时间（秒）>,
-      "end_time": <结束时间（秒）>,
-      "duration": <片段时长（秒）>,
+      "start_time": <开始时间（秒）, 从字幕中复制>,
+      "end_time": <结束时间（秒）, 从字幕中复制>,
+      "duration": <end_time - start_time, 必须精确计算>,
       "reason": "<为什么选择这个片段>"
     }}
-    // 可以有多个片段，按播放顺序排列
   ],
-  "total_duration": <所有片段总时长（秒）>,  ← **必须在 [{min_duration:.1f}s, {max_duration:.1f}s] 范围内！**
+  "total_duration": <所有clips的duration之和, 必须在[{min_duration:.1f}, {max_duration:.1f}]内>,
   "confidence": <匹配度 0-1>,
   "quality_score": <质量评分 0-100>,
   "match_level": "<匹配等级: excellent|good|acceptable|poor|none>",
   "content_match": "<内容匹配说明>",
   "issues": ["<可能存在的问题列表>"]
 }}
+
 
 评分标准:
 - excellent (90-100): 内容高度相关，画面精彩，总时长在 [{min_duration:.1f}s, {max_duration:.1f}s] 范围内
@@ -441,34 +446,88 @@ class VideoClipFinder:
         elif video_duration < min_required:
             print(f"  ⚠️ 视频片段稍短: {video_duration:.2f}s < {min_required:.2f}s (音频+0.5s)")
             
-            # 尝试延长：从当前结束行往后找字幕
-            start_time = clip_info['start_time']
-            current_end_line = clip_info['end_line']
-            
-            new_end_line = current_end_line
-            new_end_time = clip_info['end_time']
-            
-            for sub in sorted(range_subs, key=lambda x: x['index']):
-                if sub['index'] <= current_end_line:
-                    continue
+            # 🔧 修复：多片段模式也需要延长
+            if clip_info.get('multi_clip') and 'clips' in clip_info:
+                # 多片段延长：在最后一个片段后继续添加字幕
+                last_clip = clip_info['clips'][-1]
+                current_duration = clip_info['duration']
+                needed_duration = min_required - current_duration
+                
+                print(f"  📏 当前总时长 {current_duration:.2f}s，需要延长 {needed_duration:.2f}s")
+                
+                # 从最后一个片段的结束行往后找
+                new_clips = []
+                accumulated = 0.0
+                
+                for sub in sorted(range_subs, key=lambda x: x['index']):
+                    if sub['index'] <= last_clip['end_line']:
+                        continue
                     
-                # 检查包含这一行后的总时长
-                potential_duration = sub['end_time'] - start_time
-                if potential_duration <= max_allowed:
-                    new_end_line = sub['index']
-                    new_end_time = sub['end_time']
-                    
-                    # 达到最小要求就停止
-                    if potential_duration >= min_required:
+                    # 计算如果添加这一行，总时长是否合适
+                    clip_duration = sub['end_time'] - sub['start_time']
+                    if accumulated + clip_duration <= needed_duration + 1.0:  # 允许稍微超一点
+                        if not new_clips:
+                            # 第一行，创建新片段
+                            new_clips.append({
+                                'start_line': sub['index'],
+                                'end_line': sub['index'],
+                                'start_time': sub['start_time'],
+                                'end_time': sub['end_time'],
+                                'duration': clip_duration,
+                                'reason': '自动延长以匹配音频时长'
+                            })
+                        else:
+                            # 扩展当前片段
+                            new_clips[-1]['end_line'] = sub['index']
+                            new_clips[-1]['end_time'] = sub['end_time']
+                            new_clips[-1]['duration'] = sub['end_time'] - new_clips[-1]['start_time']
+                        
+                        accumulated = new_clips[-1]['duration'] if new_clips else 0
+                        
+                        # 如果已经够了就停止
+                        if current_duration + accumulated >= min_required:
+                            break
+                    else:
                         break
+                
+                if new_clips:
+                    # 添加新片段到clips列表
+                    clip_info['clips'].extend(new_clips)
+                    clip_info['end_line'] = new_clips[-1]['end_line']
+                    clip_info['end_time'] = new_clips[-1]['end_time']
+                    clip_info['duration'] = current_duration + accumulated
+                    print(f"  ➕ 多片段已延长至: {clip_info['duration']:.2f}s, 新增 {len(new_clips)} 个片段")
                 else:
-                    break
-            
-            if new_end_line > current_end_line:
-                clip_info['end_line'] = new_end_line
-                clip_info['end_time'] = new_end_time
-                clip_info['duration'] = new_end_time - start_time
-                print(f"  ➕ 已延长至: {clip_info['duration']:.2f}s, 新行号范围: {clip_info['start_line']}-{new_end_line}")
+                    print(f"  ⚠️ 无法延长：范围内没有更多字幕")
+            else:
+                # 单片段延长逻辑（原有逻辑）
+                start_time = clip_info['start_time']
+                current_end_line = clip_info['end_line']
+                
+                new_end_line = current_end_line
+                new_end_time = clip_info['end_time']
+                
+                for sub in sorted(range_subs, key=lambda x: x['index']):
+                    if sub['index'] <= current_end_line:
+                        continue
+                        
+                    # 检查包含这一行后的总时长
+                    potential_duration = sub['end_time'] - start_time
+                    if potential_duration <= max_allowed:
+                        new_end_line = sub['index']
+                        new_end_time = sub['end_time']
+                        
+                        # 达到最小要求就停止
+                        if potential_duration >= min_required:
+                            break
+                    else:
+                        break
+                
+                if new_end_line > current_end_line:
+                    clip_info['end_line'] = new_end_line
+                    clip_info['end_time'] = new_end_time
+                    clip_info['duration'] = new_end_time - start_time
+                    print(f"  ➕ 已延长至: {clip_info['duration']:.2f}s, 新行号范围: {clip_info['start_line']}-{new_end_line}")
         
         return clip_info
 
