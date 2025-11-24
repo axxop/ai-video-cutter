@@ -119,9 +119,13 @@ class VideoClipFinder:
         context = []
         for sub in range_subs:
             sub_duration = sub['end_time'] - sub['start_time']
-            context.append(f"[行{sub['index']}] {sub['start_time']:.2f}s-{sub['end_time']:.2f}s (时长{sub_duration:.2f}s): {sub['text']}")
+            context.append(f"[时间 {sub['start_time']:.2f}s-{sub['end_time']:.2f}s] (时长{sub_duration:.2f}s): {sub['text']}")
         
         context_text = '\n'.join(context)
+        
+        # 记录整个范围的时间边界，供LLM参考
+        time_range_start = range_subs[0]['start_time'] if range_subs else 0
+        time_range_end = range_subs[-1]['end_time'] if range_subs else 0
         
         # 计算推荐的时长范围
         # 按照 6字/秒 的TTS语速计算
@@ -137,19 +141,21 @@ class VideoClipFinder:
 **实际音频时长: {duration:.2f} 秒** ← 这是真实的TTS音频长度！
 
 **⏱️ 要求的总视频时长: {min_duration:.1f}s 到 {max_duration:.1f}s**
+**📍 可选时间范围: {time_range_start:.2f}s - {time_range_end:.2f}s（共{time_range_end - time_range_start:.1f}秒）**
 
-可选的视频片段（原始字幕，每行都标注了时长）:
+可选的视频片段（原始字幕，每段都标注了时间和时长）:
 {context_text}
 
 **🚨 核心要求（必须严格遵守）**:
-1. **根据每个片段的时长（end_time - start_time）精确计算总时长**
-2. **总时长必须在 {min_duration:.1f}s 到 {max_duration:.1f}s 之间**
-3. **选择片段时，先用时间计算，不要只看行号！**
-4. **示例计算**: 
-   - 选择 [行10-12]: 111.2s - 103.1s = 8.1s
-   - 选择 [行73-79]: 331.5s - 312.6s = 18.9s
+1. **直接选择时间范围（秒），不要使用行号**
+2. **根据每个片段的时长（end_time - start_time）精确计算总时长**
+3. **总时长必须在 {min_duration:.1f}s 到 {max_duration:.1f}s 之间**
+4. **可以精确到小数点后1位（如 123.5s）**
+5. **示例计算**: 
+   - 选择片段1: 103.1s - 111.2s = 8.1s
+   - 选择片段2: 312.6s - 331.5s = 18.9s
    - 总时长: 8.1s + 18.9s = 27.0s ❌ 超过 {max_duration:.1f}s！
-   - 正确做法: 只选1个片段，或调整范围使总时长符合要求
+   - 正确做法: 只选1个片段，或调整时间范围使总时长符合要求
 
 选择策略:
 - **第一步**: 先计算需要多少秒视频（{min_duration:.1f}s - {max_duration:.1f}s）
@@ -162,10 +168,8 @@ class VideoClipFinder:
 {{
   "clips": [
     {{
-      "start_line": <起始行号>,
-      "end_line": <结束行号>,
-      "start_time": <开始时间（秒）, 从字幕中复制>,
-      "end_time": <结束时间（秒）, 从字幕中复制>,
+      "start_time": <开始时间（秒），精确到0.1秒>,
+      "end_time": <结束时间（秒），精确到0.1秒>,
       "duration": <end_time - start_time, 必须精确计算>,
       "reason": "<为什么选择这个片段>"
     }}
@@ -194,8 +198,8 @@ class VideoClipFinder:
 假设音频时长 10秒，要求总时长 10.5-13秒：
 {{
   "clips": [
-    {{"start_line": 10, "end_line": 13, "start_time": 20.5, "end_time": 25.3, "duration": 4.8, "reason": "基德出现画面"}},
-    {{"start_line": 25, "end_line": 30, "start_time": 50.2, "end_time": 56.5, "duration": 6.3, "reason": "预告信特写"}}
+    {{"start_time": 20.5, "end_time": 25.3, "duration": 4.8, "reason": "基德出现的精彩画面"}},
+    {{"start_time": 50.2, "end_time": 56.5, "duration": 6.3, "reason": "预告信特写镜头"}}
   ],
   "total_duration": 11.1,  ← 在 [10.5, 13] 范围内 ✓
   "confidence": 0.9,
@@ -226,23 +230,24 @@ class VideoClipFinder:
                 total_duration = 0.0
                 
                 for clip in result['clips']:
-                    start_line = clip['start_line']
-                    end_line = clip['end_line']
+                    # 新版：直接使用时间，不再需要查询行号
+                    start_time = clip.get('start_time')
+                    end_time = clip.get('end_time')
                     
-                    # 从完整字幕列表中查找，不限于range_subs
-                    start_sub = next((s for s in subtitles if s['index'] == start_line), None)
-                    end_sub = next((s for s in subtitles if s['index'] == end_line), None)
-                    
-                    if not start_sub or not end_sub:
-                        print(f"  ⚠️ 跳过片段: 无法找到行号 {start_line}-{end_line} 对应的字幕")
+                    if start_time is None or end_time is None:
+                        print(f"  ⚠️ 跳过片段: 缺少时间信息 {clip}")
                         continue
                     
-                    clip_duration = end_sub['end_time'] - start_sub['start_time']
+                    # 找到最接近的字幕行号（用于显示和记录）
+                    start_sub = min(subtitles, key=lambda s: abs(s['start_time'] - start_time))
+                    end_sub = min(subtitles, key=lambda s: abs(s['end_time'] - end_time))
+                    
+                    clip_duration = end_time - start_time
                     clips_info.append({
-                        'start_line': start_line,
-                        'end_line': end_line,
-                        'start_time': start_sub['start_time'],
-                        'end_time': end_sub['end_time'],
+                        'start_line': start_sub['index'],  # 仅用于显示
+                        'end_line': end_sub['index'],      # 仅用于显示
+                        'start_time': start_time,
+                        'end_time': end_time,
                         'duration': clip_duration,
                         'reason': clip.get('reason', '')
                     })
@@ -268,21 +273,23 @@ class VideoClipFinder:
                 
             else:
                 # 兼容旧的单片段格式
-                start_line = result['start_line']
-                end_line = result['end_line']
+                start_time = result.get('start_time')
+                end_time = result.get('end_time')
                 
-                # 从完整字幕列表中查找，不限于range_subs
-                start_sub = next((s for s in subtitles if s['index'] == start_line), None)
-                end_sub = next((s for s in subtitles if s['index'] == end_line), None)
-                
-                if not start_sub or not end_sub:
-                    print(f"  ⚠️ 无法找到行号 {start_line}-{end_line} 对应的字幕")
+                if start_time is None or end_time is None:
+                    print(f"  ⚠️ 返回结果缺少时间信息")
                     return None
                 
-                # 使用字幕的真实时间
-                result['start_time'] = start_sub['start_time']
-                result['end_time'] = end_sub['end_time']
-                result['duration'] = result['end_time'] - result['start_time']
+                # 找到最接近的字幕行号（用于显示）
+                start_sub = min(subtitles, key=lambda s: abs(s['start_time'] - start_time))
+                end_sub = min(subtitles, key=lambda s: abs(s['end_time'] - end_time))
+                
+                # 使用LLM返回的时间
+                result['start_line'] = start_sub['index']  # 仅用于显示
+                result['end_line'] = end_sub['index']      # 仅用于显示
+                result['start_time'] = start_time
+                result['end_time'] = end_time
+                result['duration'] = end_time - start_time
             
             # 验证时间区间
             result = self._validate_clip_duration(result, duration, range_subs)
