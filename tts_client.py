@@ -28,6 +28,12 @@ class CosyVoiceClient:
             config: CosyVoiceConfig 配置实例
         """
         self.config = config
+        # 检查 API key 是否有效
+        if not config.api_key:
+            raise ValueError(
+                "BAILIAN_API_KEY is required. "
+                "Please set the BAILIAN_API_KEY environment variable or pass it to CosyVoiceConfig."
+            )
         # 设置 DashScope API Key
         dashscope.api_key = config.api_key
     
