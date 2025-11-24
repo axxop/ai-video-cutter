@@ -1,3 +1,8 @@
-# Ignore rendered video outputs
+# Ignore raw and rendered video/media assets
 /video_clips/*
 /p_tts_output/*
+/conan_tts_output/*
+/origin_videos/*
+*.mp4
+*.mov
+*.mkv
