@@ -122,46 +122,77 @@ class VideoClipFinder:
         
         context_text = '\n'.join(context)
         
-        # 计算推荐的时长范围：音频时长 + 0.5s 到 音频时长 + 2s
-        min_duration = duration + 0.5
-        max_duration = duration + 2.0
+        # 计算推荐的时长范围
+        # 按照 6字/秒 的TTS语速计算
+        text_length = len(narration_text)
+        estimated_tts_duration = text_length / 6.0
+        min_duration = max(duration, estimated_tts_duration) + 0.5
+        max_duration = max(duration, estimated_tts_duration) + 3.0
         
         prompt = f"""你是一个视频剪辑专家。现在需要为以下旁白找到最匹配的视频片段。
 
 旁白文本: {narration_text}
-旁白音频时长: {duration:.2f} 秒
+旁白文本长度: {text_length} 字
+**实际音频时长: {duration:.2f} 秒** ← 这是真实的TTS音频长度！
 
 可选的视频片段（原始字幕）:
 {context_text}
 
-请分析这些字幕，找出最适合这段旁白的连续视频片段。要求:
-1. 片段的内容要与旁白意思相关或匹配
-2. **重要**: 视频片段时长必须在 {min_duration:.2f}s 到 {max_duration:.2f}s 之间（比音频稍长0.5-2秒，避免截断说话）
-3. 优先选择动作性强、画面精彩的片段
-4. 片段必须是连续的字幕，不能跳跃
-5. 确保选择的时间区间在提供的范围内
+**🚨 核心要求（必须严格遵守）**:
+1. **视频片段总时长 MUST >= {min_duration:.1f}秒**（音频时长 {duration:.2f}s + 0.5s缓冲）
+2. **宁可选长，不能选短！** 短了会导致解说卡顿！
+3. 可以选择多个不连续片段拼接，只要总时长够
+4. 最大时长不超过 {max_duration:.1f}秒
+
+选择策略:
+- 优先选择内容相关且画面精彩的片段
+- 如果单个片段不够长，**必须选择多个片段拼接**
+- 片段内容要与旁白意思相关
+- 每段内部必须连续（如 [10-15]），但段与段之间可以跳跃（如 [10-15] + [25-30]）
 
 请以 JSON 格式返回，只返回 JSON，不要其他内容:
 {{
-  "start_line": <起始行号>,
-  "end_line": <结束行号>,
-  "start_time": <开始时间（秒）>,
-  "end_time": <结束时间（秒）>,
-  "duration": <实际时长（秒）>,
+  "clips": [
+    {{
+      "start_line": <起始行号>,
+      "end_line": <结束行号>,
+      "start_time": <开始时间（秒）>,
+      "end_time": <结束时间（秒）>,
+      "duration": <片段时长（秒）>,
+      "reason": "<为什么选择这个片段>"
+    }}
+    // 可以有多个片段，按播放顺序排列
+  ],
+  "total_duration": <所有片段总时长（秒）>,  ← **必须 >= {min_duration:.1f}秒！**
   "confidence": <匹配度 0-1>,
   "quality_score": <质量评分 0-100>,
   "match_level": "<匹配等级: excellent|good|acceptable|poor|none>",
-  "reason": "<选择理由>",
   "content_match": "<内容匹配说明>",
   "issues": ["<可能存在的问题列表>"]
 }}
 
 评分标准:
-- excellent (90-100): 内容高度相关，画面精彩，时长完美
-- good (70-89): 内容相关，画面合适，时长符合
-- acceptable (50-69): 内容部分相关或时长稍有出入
-- poor (30-49): 内容勉强相关或存在明显问题
-- none (0-29): 几乎无相关内容或无法匹配
+- excellent (90-100): 内容高度相关，画面精彩，总时长 >= {min_duration:.1f}s
+- good (70-89): 内容相关，画面合适，总时长 >= {min_duration:.1f}s
+- acceptable (50-69): 内容部分相关，总时长 >= {min_duration:.1f}s（刚好够）
+- poor (30-49): 内容勉强相关 **或 总时长 < {min_duration:.1f}s**（会卡顿！）
+- none (0-29): 几乎无相关内容或总时长严重不足
+
+**⚠️ 重要**: 如果总时长 < {min_duration:.1f}秒，评分最高只能是 poor (30-49分)！
+
+**示例返回（多片段）**:
+{{
+  "clips": [
+    {{"start_line": 10, "end_line": 15, "start_time": 20.5, "end_time": 25.3, "duration": 4.8, "reason": "基德出现画面"}},
+    {{"start_line": 25, "end_line": 30, "start_time": 50.2, "end_time": 56.1, "duration": 5.9, "reason": "预告信特写"}}
+  ],
+  "total_duration": 10.7,
+  "confidence": 0.9,
+  "quality_score": 92,
+  "match_level": "excellent",
+  "content_match": "精确匹配基德预告信场景",
+  "issues": []
+}}
 """
         
         try:
@@ -177,22 +208,68 @@ class VideoClipFinder:
             
             result = json.loads(response.choices[0].message.content)
             
-            # **关键修复**: 从原始字幕中获取真实的时间，而不是使用 LLM 生成的时间
-            start_line = result['start_line']
-            end_line = result['end_line']
-            
-            # 查找对应行号的字幕
-            start_sub = next((s for s in range_subs if s['index'] == start_line), None)
-            end_sub = next((s for s in range_subs if s['index'] == end_line), None)
-            
-            if not start_sub or not end_sub:
-                print(f"  ⚠️ 无法找到行号 {start_line}-{end_line} 对应的字幕")
-                return None
-            
-            # 使用字幕的真实时间
-            result['start_time'] = start_sub['start_time']
-            result['end_time'] = end_sub['end_time']
-            result['duration'] = result['end_time'] - result['start_time']
+            # 处理多片段返回格式
+            if 'clips' in result and isinstance(result['clips'], list) and len(result['clips']) > 0:
+                # 多片段模式：保存所有片段信息用于后续拼接
+                clips_info = []
+                total_duration = 0.0
+                
+                for clip in result['clips']:
+                    start_line = clip['start_line']
+                    end_line = clip['end_line']
+                    
+                    start_sub = next((s for s in range_subs if s['index'] == start_line), None)
+                    end_sub = next((s for s in range_subs if s['index'] == end_line), None)
+                    
+                    if not start_sub or not end_sub:
+                        print(f"  ⚠️ 跳过片段: 无法找到行号 {start_line}-{end_line} 对应的字幕")
+                        continue
+                    
+                    clip_duration = end_sub['end_time'] - start_sub['start_time']
+                    clips_info.append({
+                        'start_line': start_line,
+                        'end_line': end_line,
+                        'start_time': start_sub['start_time'],
+                        'end_time': end_sub['end_time'],
+                        'duration': clip_duration,
+                        'reason': clip.get('reason', '')
+                    })
+                    total_duration += clip_duration
+                
+                if not clips_info:
+                    print(f"  ⚠️ 无法找到任何有效片段")
+                    return None
+                
+                # 保存所有片段信息
+                result['clips'] = clips_info
+                result['start_line'] = clips_info[0]['start_line']
+                result['end_line'] = clips_info[-1]['end_line']
+                result['start_time'] = clips_info[0]['start_time']
+                result['end_time'] = clips_info[-1]['end_time']
+                result['duration'] = total_duration
+                result['multi_clip'] = True  # 标记为多片段模式
+                
+                print(f"  📹 LLM返回多片段模式: {len(clips_info)} 个片段，总时长 {total_duration:.2f}s")
+                for i, clip in enumerate(clips_info, 1):
+                    print(f"     片段{i}: 行{clip['start_line']}-{clip['end_line']}, "
+                          f"{clip['start_time']:.1f}s-{clip['end_time']:.1f}s ({clip['duration']:.1f}s) - {clip['reason']}")
+                
+            else:
+                # 兼容旧的单片段格式
+                start_line = result['start_line']
+                end_line = result['end_line']
+                
+                start_sub = next((s for s in range_subs if s['index'] == start_line), None)
+                end_sub = next((s for s in range_subs if s['index'] == end_line), None)
+                
+                if not start_sub or not end_sub:
+                    print(f"  ⚠️ 无法找到行号 {start_line}-{end_line} 对应的字幕")
+                    return None
+                
+                # 使用字幕的真实时间
+                result['start_time'] = start_sub['start_time']
+                result['end_time'] = end_sub['end_time']
+                result['duration'] = result['end_time'] - result['start_time']
             
             # 验证时间区间
             result = self._validate_clip_duration(result, duration, range_subs)

@@ -14,6 +14,7 @@ import re
 import hashlib
 import argparse
 import shutil
+import time
 from pathlib import Path
 from typing import List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -88,11 +89,11 @@ class ScriptParserV2:
     @staticmethod
     def parse_script_file(script_file: str, chunk_words: int = 30) -> List[Dict]:
         """
-        解析 V2 格式文案脚本文件
+        解析 V2 格式文案脚本文件 - 按句号和换行分割
         
         Args:
             script_file: 文案文件路径
-            chunk_words: 每个片段的字数（默认30字，约6-8秒TTS）
+            chunk_words: 未使用（保留参数兼容性），实际按句号/换行分割
             
         Returns:
             [{'text': '...', 'line_ranges': [[1,5], [6,10]], 'keywords': [...]}]
@@ -100,70 +101,70 @@ class ScriptParserV2:
         with open(script_file, 'r', encoding='utf-8') as f:
             content = f.read().strip()
         
-        # 提取所有关键词和行号标记
-        # 格式: 关键词[行号范围]
-        pattern = r'([^[\]]+?)\[(\d+)-(\d+)\]'
+        # 先按段落分割（连续两个换行符）
+        paragraphs = re.split(r'\n\s*\n', content)
         
-        # 先将文本分割成带行号标记的片段
-        annotated_segments = []
-        pos = 0
-        
-        for match in re.finditer(pattern, content):
-            keyword = match.group(1).strip()
-            line_start = int(match.group(2))
-            line_end = int(match.group(3))
-            
-            # 添加关键词段落
-            if keyword:
-                annotated_segments.append({
-                    'text': keyword,
-                    'line_range': [line_start, line_end],
-                    'is_keyword': True
-                })
-            
-            pos = match.end()
-        
-        # 按字数切分成小片段
         segments = []
-        current_text = ""
-        current_line_ranges = []
-        current_keywords = []
         
-        for seg in annotated_segments:
-            # 添加关键词到当前片段
-            current_text += seg['text']
-            current_line_ranges.append(seg['line_range'])
-            current_keywords.append(seg['text'])
+        for paragraph in paragraphs:
+            # 跳过空段落
+            if not paragraph.strip():
+                continue
             
-            # 如果达到字数限制，创建新片段
-            if len(current_text) >= chunk_words:
-                if current_text.strip():
-                    segments.append({
-                        'text': current_text.strip(),
-                        'line_ranges': current_line_ranges.copy(),
-                        'keywords': current_keywords.copy(),
-                        'line_range': [
-                            min(r[0] for r in current_line_ranges),
-                            max(r[1] for r in current_line_ranges)
-                        ]
-                    })
+            # 提取段落中的所有关键词和行号标记
+            # 格式: 关键词[行号范围]
+            pattern = r'([^[\]]+?)\[(\d+)-(\d+)\]'
+            
+            # 将段落分割成带行号标记的片段
+            annotated_segments = []
+            
+            for match in re.finditer(pattern, paragraph):
+                keyword = match.group(1).strip()
+                line_start = int(match.group(2))
+                line_end = int(match.group(3))
                 
-                # 重置
-                current_text = ""
-                current_line_ranges = []
-                current_keywords = []
-        
-        # 添加最后一个片段
-        if current_text.strip():
-            segments.append({
-                'text': current_text.strip(),
-                'line_ranges': current_line_ranges.copy(),
-                'keywords': current_keywords.copy(),
-                'line_range': [
-                    min(r[0] for r in current_line_ranges),
-                    max(r[1] for r in current_line_ranges)
-                ]
-            })
+                if keyword:
+                    annotated_segments.append({
+                        'text': keyword,
+                        'line_range': [line_start, line_end]
+                    })
+            
+            # 按句号分割段落内的文本
+            current_text = ""
+            current_line_ranges = []
+            
+            for seg in annotated_segments:
+                current_text += seg['text']
+                current_line_ranges.append(seg['line_range'])
+                
+                # 检查是否遇到句号（中文或英文）
+                if current_text.rstrip().endswith(('。', '.', '！', '!', '？', '?')):
+                    if current_text.strip() and current_line_ranges:
+                        segments.append({
+                            'text': current_text.strip(),
+                            'line_ranges': current_line_ranges.copy(),
+                            'keywords': [s['text'] for s in annotated_segments[:len(current_line_ranges)]],
+                            'line_range': [
+                                min(r[0] for r in current_line_ranges),
+                                max(r[1] for r in current_line_ranges)
+                            ]
+                        })
+                    
+                    # 重置
+                    current_text = ""
+                    current_line_ranges = []
+            
+            # 添加段落最后一个片段（如果没有以句号结尾）
+            if current_text.strip() and current_line_ranges:
+                segments.append({
+                    'text': current_text.strip(),
+                    'line_ranges': current_line_ranges.copy(),
+                    'keywords': [s['text'] for s in annotated_segments[:len(current_line_ranges)]],
+                    'line_range': [
+                        min(r[0] for r in current_line_ranges),
+                        max(r[1] for r in current_line_ranges)
+                    ]
+                })
         
         return segments
 
@@ -210,21 +211,34 @@ class ParallelTTSGenerator:
                 'from_cache': True
             }
         
-        # 生成 TTS
-        try:
-            print(f"  [{index}] 🎤 生成 TTS: {text[:40]}...")
-            result = self.tts_client.synthesize(text, str(cache_path))
-            
-            return {
-                'index': index,
-                'audio_file': str(cache_path),
-                'text': text,
-                'line_range': segment['line_range'],
-                'from_cache': False
-            }
-        except Exception as e:
-            print(f"  [{index}] ❌ TTS 生成失败: {e}")
-            return None
+        # 生成 TTS（带重试逻辑）
+        max_retries = 3
+        retry_delay = 2  # 秒
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                if attempt > 1:
+                    print(f"  [{index}] 🔄 重试 {attempt}/{max_retries}...")
+                    time.sleep(retry_delay)
+                
+                print(f"  [{index}] 🎤 生成 TTS: {text[:40]}...")
+                result = self.tts_client.synthesize(text, str(cache_path))
+                
+                return {
+                    'index': index,
+                    'audio_file': str(cache_path),
+                    'text': text,
+                    'line_range': segment['line_range'],
+                    'from_cache': False
+                }
+            except Exception as e:
+                if attempt == max_retries:
+                    print(f"  [{index}] ❌ TTS 生成失败（已重试 {max_retries} 次）: {e}")
+                    return None
+                else:
+                    print(f"  [{index}] ⚠️  TTS 失败: {e}")
+        
+        return None
     
     def generate_all(self, segments: List[Dict]) -> List[Dict]:
         """并行生成所有 TTS 音频"""
@@ -264,10 +278,15 @@ class ParallelClipSelector:
         deepseek_key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
         self.clip_finder = VideoClipFinder(deepseek_key)
     
-    def select_one(self, segment: Dict, index: int) -> Dict:
+    def select_one(self, segment: Dict, index: int, audio_file: str = None) -> Dict:
         """
         为单个片段选择最佳视频片段（带缓存）
         使用 DeepSeek 在指定行号范围内细化选择
+        
+        Args:
+            segment: 片段信息
+            index: 片段索引
+            audio_file: TTS音频文件路径（用于获取真实时长）
         """
         text = segment['text']
         line_start, line_end = segment['line_range']
@@ -283,11 +302,28 @@ class ParallelClipSelector:
             cached_result['index'] = index
             return cached_result
         
+        # 获取真实的TTS音频时长
+        import subprocess
+        actual_duration = len(text) / 6.0  # 默认预估
+        
+        if audio_file and os.path.exists(audio_file):
+            try:
+                # 使用ffprobe获取音频时长
+                result = subprocess.run(
+                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                     '-of', 'default=noprint_wrappers=1:nokey=1', audio_file],
+                    capture_output=True, text=True, check=True
+                )
+                actual_duration = float(result.stdout.strip())
+                print(f"  [{index}] 🎵 真实音频时长: {actual_duration:.2f}s")
+            except:
+                print(f"  [{index}] ⚠️  无法获取音频时长，使用预估值: {actual_duration:.2f}s")
+        
         # 调用 DeepSeek 选择片段
         print(f"  [{index}] 🤖 DeepSeek 选择片段: [{line_start}-{line_end}] {text[:40]}...")
         
         clip_info = self.clip_finder.find_best_clip(
-            text, self.subtitles, line_start, line_end, target_duration=None  # V2不指定时长
+            text, self.subtitles, line_start, line_end, actual_duration
         )
         
         if not clip_info:
@@ -361,19 +397,114 @@ class ParallelVideoClipper:
         self.max_workers = max_workers
     
     def extract_one(self, clip_info: Dict, audio_file: str, index: int) -> Dict:
-        """提取单个视频片段并添加配音+字幕（带缓存）"""
+        """提取单个视频片段并添加配音+字幕（带缓存，支持多片段拼接）"""
         import subprocess
         import tempfile
         
-        start_time = clip_info['start_time']
-        end_time = clip_info['end_time']
         text = clip_info['text']
         
-        # 计算实际视频片段时长
-        duration = end_time - start_time
+        # 检查是否为多片段模式
+        is_multi_clip = clip_info.get('multi_clip', False)
         
+        if is_multi_clip and 'clips' in clip_info:
+            # 多片段拼接模式
+            return self._extract_multi_clips(clip_info, audio_file, index)
+        else:
+            # 单片段模式
+            start_time = clip_info['start_time']
+            end_time = clip_info['end_time']
+            duration = end_time - start_time
+            
+            return self._extract_single_clip(start_time, duration, text, audio_file, index)
+    
+    def _extract_multi_clips(self, clip_info: Dict, audio_file: str, index: int) -> Dict:
+        """提取并拼接多个视频片段"""
+        import subprocess
+        import tempfile
+        
+        text = clip_info['text']
+        clips = clip_info['clips']
+        
+        # 生成缓存键（基于所有片段信息）
+        clips_key = ','.join([f"{c['start_time']:.2f}-{c['end_time']:.2f}" for c in clips])
+        cache_key = f"multi:{clips_key}:{audio_file}:{text}"
+        cache_hash = self.cache_manager.get_hash(cache_key)
+        cache_path = self.cache_manager.get_clip_cache_path(cache_hash)
+        
+        # 检查缓存
+        if cache_path.exists():
+            print(f"  [{index}] ✓ 使用缓存多片段: {cache_path.name}")
+            return {
+                'index': index,
+                'video_file': str(cache_path),
+                'audio_file': audio_file,
+                'text': text,
+                'from_cache': True
+            }
+        
+        print(f"       ⏳ 开始拼接 {len(clips)} 个视频片段...")
+        
+        # Step 1: 提取各个片段到临时文件
+        temp_clips = []
+        for i, clip in enumerate(clips, 1):
+            temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.mp4', delete=False)
+            temp_file.close()
+            
+            cmd = [
+                'ffmpeg', '-y', '-loglevel', 'error',
+                '-ss', str(clip['start_time']),
+                '-i', self.original_video,
+                '-t', str(clip['duration']),
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-an',  # 不要音频，稍后统一添加
+                temp_file.name
+            ]
+            
+            print(f"       提取片段{i}/{len(clips)}: {clip['start_time']:.1f}s-{clip['end_time']:.1f}s ({clip['duration']:.1f}s)")
+            subprocess.run(cmd, check=True)
+            temp_clips.append(temp_file.name)
+        
+        # Step 2: 拼接所有片段
+        concat_list = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+        for clip_file in temp_clips:
+            concat_list.write(f"file '{clip_file}'\n")
+        concat_list.close()
+        
+        temp_concat = tempfile.NamedTemporaryFile(mode='w', suffix='.mp4', delete=False)
+        temp_concat.close()
+        
+        print(f"       拼接 {len(temp_clips)} 个片段...")
+        cmd = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-f', 'concat', '-safe', '0',
+            '-i', concat_list.name,
+            '-c', 'copy',
+            temp_concat.name
+        ]
+        subprocess.run(cmd, check=True)
+        
+        # Step 3: 添加字幕和配音
+        result = self._add_subtitles_and_audio(temp_concat.name, text, audio_file, cache_path, index)
+        
+        # 清理临时文件
+        for temp_file in temp_clips:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+        try:
+            os.unlink(concat_list.name)
+            os.unlink(temp_concat.name)
+        except:
+            pass
+        
+        return result
+    
+    def _extract_single_clip(self, start_time: float, duration: float, text: str, 
+                            audio_file: str, index: int) -> Dict:
+        """提取单个视频片段"""
         # 生成缓存键
-        cache_key = f"{start_time:.2f}-{end_time:.2f}:{audio_file}:{text}"
+        cache_key = f"{start_time:.2f}-{duration:.2f}:{audio_file}:{text}"
         cache_hash = self.cache_manager.get_hash(cache_key)
         cache_path = self.cache_manager.get_clip_cache_path(cache_hash)
         
@@ -388,25 +519,99 @@ class ParallelVideoClipper:
                 'from_cache': True
             }
         
-        # 提取视频片段
         print(f"       ⏳ 开始压制视频片段...")
         
-        # 创建临时字幕文件
-        srt_file = tempfile.NamedTemporaryFile(mode='w', suffix='.srt', delete=False, encoding='utf-8')
-        srt_file.write(f"1\n00:00:00,000 --> {self._format_srt_time(duration)}\n{text}\n")
-        srt_file.close()
+        # 提取视频片段到临时文件
+        import subprocess
+        import tempfile
         
-        print(f"       字幕文件: {srt_file.name}")
-        print(f"       字幕时长: 00:00:00,000 --> {self._format_srt_time(duration)}")
-        print(f"       字幕内容: {text[:50]}...")
+        temp_video = tempfile.NamedTemporaryFile(mode='w', suffix='.mp4', delete=False)
+        temp_video.close()
         
-        # FFmpeg 命令：提取视频 + 添加配音 + 烧录字幕
         cmd = [
             'ffmpeg', '-y', '-loglevel', 'error',
             '-ss', str(start_time),
             '-i', self.original_video,
-            '-i', audio_file,
             '-t', str(duration),
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-an',
+            temp_video.name
+        ]
+        subprocess.run(cmd, check=True)
+        
+        # 添加字幕和配音
+        result = self._add_subtitles_and_audio(temp_video.name, text, audio_file, cache_path, index)
+        
+        # 清理临时文件
+        try:
+            os.unlink(temp_video.name)
+        except:
+            pass
+        
+        return result
+    
+    def _add_subtitles_and_audio(self, video_file: str, text: str, audio_file: str, 
+                                 output_path: Path, index: int) -> Dict:
+        """为视频添加字幕和配音"""
+        import subprocess
+        import tempfile
+        import re
+        
+        # 获取视频时长
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', video_file],
+            capture_output=True, text=True, check=True
+        )
+        duration = float(result.stdout.strip())
+        
+        # 清理字幕文本：去掉开头的标点符号
+        clean_text = text.lstrip('，。,. \t')
+        
+        # 创建临时字幕文件 - 按标点符号自然断句
+        srt_file = tempfile.NamedTemporaryFile(mode='w', suffix='.srt', delete=False, encoding='utf-8')
+        
+        # 按标点符号分割字幕（逗号、句号、感叹号、问号）
+        segments = re.split(r'([，。,!！?？])', clean_text)
+        
+        # 重组：将标点符号附加到前一个片段
+        merged_segments = []
+        for i in range(0, len(segments), 2):
+            if i < len(segments):
+                seg = segments[i]
+                if i + 1 < len(segments):
+                    seg += segments[i + 1]  # 附加标点
+                if seg.strip():  # 跳过空片段
+                    merged_segments.append(seg)
+        
+        if not merged_segments:  # 如果没有标点，整段作为一个字幕
+            merged_segments = [clean_text]
+        
+        # 计算每段的时间（按字数比例分配）
+        total_chars = sum(len(s) for s in merged_segments)
+        
+        # 生成 SRT 内容
+        srt_content = []
+        current_time = 0.0
+        for idx, seg in enumerate(merged_segments):
+            seg_duration = (len(seg) / total_chars) * duration
+            start = current_time
+            end = current_time + seg_duration
+            srt_content.append(f"{idx+1}\n{self._format_srt_time(start)} --> {self._format_srt_time(end)}\n{seg}\n")
+            current_time = end
+        
+        srt_file.write('\n'.join(srt_content))
+        srt_file.close()
+        
+        print(f"       字幕文件: {srt_file.name}")
+        print(f"       字幕分段: {len(merged_segments)} 段（按标点符号自然断句）")
+        print(f"       字幕内容: {clean_text[:50]}...")
+        
+        # FFmpeg 命令：添加配音 + 烧录字幕 + 缩放
+        cmd = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-i', video_file,
+            '-i', audio_file,
             '-filter_complex',
             f"[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,subtitles={srt_file.name}:force_style='Fontsize=8,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1,MarginV=40,Alignment=2'[vout]",
             '-map', '[vout]',
@@ -416,15 +621,15 @@ class ParallelVideoClipper:
             '-crf', '23',
             '-c:a', 'aac',
             '-b:a', '128k',
-            '-ar', '44100',  # 采样率44.1kHz，更兼容
-            '-ac', '2',  # 立体声
-            str(cache_path)
+            '-ar', '44100',
+            '-ac', '2',
+            str(output_path)
         ]
         
         try:
-            print(f"       🎬 FFmpeg 压制中...")
+            print(f"       🎬 FFmpeg 添加字幕和配音...")
             subprocess.run(cmd, check=True, timeout=120)
-            print(f"       ✅ 压制成功: {cache_path.name}")
+            print(f"       ✅ 压制成功: {output_path.name}")
         except Exception as e:
             print(f"       ❌ 压制失败: {e}")
             return None
@@ -436,7 +641,7 @@ class ParallelVideoClipper:
         
         return {
             'index': index,
-            'video_file': str(cache_path),
+            'video_file': str(output_path),
             'audio_file': audio_file,
             'text': text,
             'from_cache': False
@@ -632,9 +837,9 @@ def main():
         
         print(f"  ✅ [{i}] TTS 完成: {tts_result['audio_file']}")
         
-        # Step 3.2: 选择视频片段
+        # Step 3.2: 选择视频片段（传入真实音频文件）
         print(f"  🤖 [{i}] DeepSeek 选择片段...")
-        clip_selection = clip_selector.select_one(tts_result, i)
+        clip_selection = clip_selector.select_one(tts_result, i, audio_file=tts_result['audio_file'])
         if not clip_selection:
             print(f"  ❌ [{i}] 片段选择失败，跳过")
             continue
