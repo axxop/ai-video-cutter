@@ -563,7 +563,32 @@ class ParallelVideoClipper:
              '-of', 'default=noprint_wrappers=1:nokey=1', video_file],
             capture_output=True, text=True, check=True
         )
-        duration = float(result.stdout.strip())
+        video_duration = float(result.stdout.strip())
+        
+        # 获取音频时长
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', audio_file],
+            capture_output=True, text=True, check=True
+        )
+        audio_duration = float(result.stdout.strip())
+        
+        # 🚨 严格检查：视频时长必须与音频时长匹配（允许误差1秒）
+        time_diff = abs(video_duration - audio_duration)
+        if time_diff > 1.0:
+            error_msg = f"\n{'='*80}\n❌ 致命错误：视频时长与音频时长不匹配！\n"
+            error_msg += f"   视频时长: {video_duration:.2f}s\n"
+            error_msg += f"   音频时长: {audio_duration:.2f}s\n"
+            error_msg += f"   差距: {time_diff:.2f}s (允许最大1.0s)\n"
+            error_msg += f"   文本: {text[:100]}...\n"
+            error_msg += f"{'='*80}\n"
+            print(error_msg)
+            raise ValueError(f"视频时长 {video_duration:.2f}s 与音频时长 {audio_duration:.2f}s 差距过大 ({time_diff:.2f}s > 1.0s)")
+        
+        print(f"       ✓ 时长验证通过: 视频 {video_duration:.2f}s ≈ 音频 {audio_duration:.2f}s (差距 {time_diff:.2f}s)")
+        
+        # 使用音频时长作为基准（更准确）
+        duration = audio_duration
         
         # 清理字幕文本：去掉开头的标点符号
         clean_text = text.lstrip('，。,. \t')

@@ -360,31 +360,82 @@ class VideoClipFinder:
         if video_duration > max_allowed:
             print(f"  ⚠️ 视频片段过长: {video_duration:.2f}s > {max_allowed:.2f}s (音频+2s)")
             
-            # 截断视频：从起始行开始，找到累计时长不超过 max_allowed 的最后一行
-            start_line = clip_info['start_line']
-            start_time = clip_info['start_time']
-            
-            new_end_line = start_line
-            new_end_time = start_time
-            
-            for sub in sorted(range_subs, key=lambda x: x['index']):
-                if sub['index'] < start_line:
-                    continue
-                if sub['index'] > clip_info['end_line']:
-                    break
-                    
-                # 检查如果包含这一行，总时长是否超限
-                potential_duration = sub['end_time'] - start_time
-                if potential_duration <= max_allowed:
-                    new_end_line = sub['index']
-                    new_end_time = sub['end_time']
+            # 🔧 修复：多片段模式需要重新计算clips列表
+            if clip_info.get('multi_clip') and 'clips' in clip_info:
+                # 多片段截断：按顺序累加片段，直到接近max_allowed
+                new_clips = []
+                accumulated_duration = 0.0
+                
+                for clip in clip_info['clips']:
+                    if accumulated_duration + clip['duration'] <= max_allowed:
+                        new_clips.append(clip)
+                        accumulated_duration += clip['duration']
+                    else:
+                        # 尝试部分包含当前片段（截断到max_allowed）
+                        remaining = max_allowed - accumulated_duration
+                        if remaining > 1.0:  # 至少要有1秒才值得添加
+                            # 在range_subs中找到这个片段可以截断到哪里
+                            clip_start_time = clip['start_time']
+                            target_end_time = clip_start_time + remaining
+                            
+                            # 找到最接近target_end_time的字幕结束点
+                            best_sub = None
+                            for sub in range_subs:
+                                if clip['start_line'] <= sub['index'] <= clip['end_line']:
+                                    if sub['end_time'] <= target_end_time:
+                                        best_sub = sub
+                                    else:
+                                        break
+                            
+                            if best_sub:
+                                new_clips.append({
+                                    'start_line': clip['start_line'],
+                                    'end_line': best_sub['index'],
+                                    'start_time': clip['start_time'],
+                                    'end_time': best_sub['end_time'],
+                                    'duration': best_sub['end_time'] - clip['start_time'],
+                                    'reason': clip['reason'] + ' (已截断)'
+                                })
+                                accumulated_duration += best_sub['end_time'] - clip['start_time']
+                        break
+                
+                if new_clips:
+                    clip_info['clips'] = new_clips
+                    clip_info['start_line'] = new_clips[0]['start_line']
+                    clip_info['end_line'] = new_clips[-1]['end_line']
+                    clip_info['start_time'] = new_clips[0]['start_time']
+                    clip_info['end_time'] = new_clips[-1]['end_time']
+                    clip_info['duration'] = accumulated_duration
+                    print(f"  ✂️ 多片段已截断至: {accumulated_duration:.2f}s, 保留 {len(new_clips)}/{len(clip_info.get('clips', []))} 个片段")
                 else:
-                    break
-            
-            clip_info['end_line'] = new_end_line
-            clip_info['end_time'] = new_end_time
-            clip_info['duration'] = new_end_time - start_time
-            print(f"  ✂️ 已截断至: {clip_info['duration']:.2f}s, 新行号范围: {start_line}-{new_end_line}")
+                    print(f"  ❌ 截断失败：无法生成有效片段")
+                    return None
+            else:
+                # 单片段截断逻辑（原有逻辑）
+                start_line = clip_info['start_line']
+                start_time = clip_info['start_time']
+                
+                new_end_line = start_line
+                new_end_time = start_time
+                
+                for sub in sorted(range_subs, key=lambda x: x['index']):
+                    if sub['index'] < start_line:
+                        continue
+                    if sub['index'] > clip_info['end_line']:
+                        break
+                        
+                    # 检查如果包含这一行，总时长是否超限
+                    potential_duration = sub['end_time'] - start_time
+                    if potential_duration <= max_allowed:
+                        new_end_line = sub['index']
+                        new_end_time = sub['end_time']
+                    else:
+                        break
+                
+                clip_info['end_line'] = new_end_line
+                clip_info['end_time'] = new_end_time
+                clip_info['duration'] = new_end_time - start_time
+                print(f"  ✂️ 已截断至: {clip_info['duration']:.2f}s, 新行号范围: {start_line}-{new_end_line}")
         
         # 检查是否太短
         elif video_duration < min_required:
