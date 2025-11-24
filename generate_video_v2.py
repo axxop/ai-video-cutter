@@ -556,25 +556,66 @@ class ParallelVideoClipper:
         import subprocess
         import tempfile
         import re
+
+        temp_files = []
+
+        def probe_duration(path: str) -> float:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', path],
+                capture_output=True, text=True, check=True
+            )
+            return float(result.stdout.strip())
         
-        # 获取视频时长
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', video_file],
-            capture_output=True, text=True, check=True
-        )
-        video_duration = float(result.stdout.strip())
+        # 获取视频/音频时长
+        video_duration = probe_duration(video_file)
+        audio_duration = probe_duration(audio_file)
         
-        # 获取音频时长
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', audio_file],
-            capture_output=True, text=True, check=True
-        )
-        audio_duration = float(result.stdout.strip())
-        
-        # 🚨 严格检查：视频时长必须与音频时长匹配（允许误差1秒）
+        # 🚨 检查：视频时长必须与音频时长匹配（允许误差1秒）
         time_diff = abs(video_duration - audio_duration)
+        if time_diff > 1.0:
+            print(f"       ⚠️ 时长不匹配，尝试自动修复: 视频 {video_duration:.2f}s vs 音频 {audio_duration:.2f}s (差距 {time_diff:.2f}s)")
+            
+            # 如果视频比音频短，克隆末帧补齐
+            if video_duration < audio_duration:
+                pad_seconds = audio_duration - video_duration
+                padded_video = tempfile.NamedTemporaryFile(mode='w', suffix='.mp4', delete=False)
+                padded_video.close()
+                
+                pad_cmd = [
+                    'ffmpeg', '-y', '-loglevel', 'error',
+                    '-i', video_file,
+                    '-vf', f"tpad=stop_mode=clone:stop_duration={pad_seconds:.2f}",
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                    '-an',
+                    padded_video.name
+                ]
+                subprocess.run(pad_cmd, check=True)
+                video_file = padded_video.name
+                temp_files.append(padded_video.name)
+                print(f"       🩹 自动补帧: 末帧延长 {pad_seconds:.2f}s 以匹配音频")
+            else:
+                # 视频比音频长，截断到音频长度
+                trimmed_video = tempfile.NamedTemporaryFile(mode='w', suffix='.mp4', delete=False)
+                trimmed_video.close()
+                
+                trim_cmd = [
+                    'ffmpeg', '-y', '-loglevel', 'error',
+                    '-i', video_file,
+                    '-t', f"{audio_duration:.2f}",
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                    '-an',
+                    trimmed_video.name
+                ]
+                subprocess.run(trim_cmd, check=True)
+                video_file = trimmed_video.name
+                temp_files.append(trimmed_video.name)
+                print(f"       ✂️ 自动截断: 视频裁切到 {audio_duration:.2f}s")
+            
+            # 修复后重新计算时长
+            video_duration = probe_duration(video_file)
+            time_diff = abs(video_duration - audio_duration)
+        
         if time_diff > 1.0:
             error_msg = f"\n{'='*80}\n❌ 致命错误：视频时长与音频时长不匹配！\n"
             error_msg += f"   视频时长: {video_duration:.2f}s\n"
@@ -663,6 +704,11 @@ class ParallelVideoClipper:
                 os.unlink(srt_file.name)
             except:
                 pass
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
         
         return {
             'index': index,

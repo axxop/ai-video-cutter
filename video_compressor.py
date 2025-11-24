@@ -26,7 +26,7 @@ class SRTParser:
         """
         subtitles = []
         
-        with open(srt_file, 'r', encoding='utf-8') as f:
+        with open(srt_file, 'r', encoding='utf-8-sig') as f:  # utf-8-sig 自动去除BOM
             content = f.read()
         
         # 分割每个字幕块
@@ -229,8 +229,9 @@ class VideoClipFinder:
                     start_line = clip['start_line']
                     end_line = clip['end_line']
                     
-                    start_sub = next((s for s in range_subs if s['index'] == start_line), None)
-                    end_sub = next((s for s in range_subs if s['index'] == end_line), None)
+                    # 从完整字幕列表中查找，不限于range_subs
+                    start_sub = next((s for s in subtitles if s['index'] == start_line), None)
+                    end_sub = next((s for s in subtitles if s['index'] == end_line), None)
                     
                     if not start_sub or not end_sub:
                         print(f"  ⚠️ 跳过片段: 无法找到行号 {start_line}-{end_line} 对应的字幕")
@@ -270,8 +271,9 @@ class VideoClipFinder:
                 start_line = result['start_line']
                 end_line = result['end_line']
                 
-                start_sub = next((s for s in range_subs if s['index'] == start_line), None)
-                end_sub = next((s for s in range_subs if s['index'] == end_line), None)
+                # 从完整字幕列表中查找，不限于range_subs
+                start_sub = next((s for s in subtitles if s['index'] == start_line), None)
+                end_sub = next((s for s in subtitles if s['index'] == end_line), None)
                 
                 if not start_sub or not end_sub:
                     print(f"  ⚠️ 无法找到行号 {start_line}-{end_line} 对应的字幕")

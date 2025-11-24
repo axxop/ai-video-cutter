@@ -16,16 +16,21 @@ class SRTParser:
     """SRT 字幕解析器"""
     
     @staticmethod
-    def parse_srt(srt_file: str) -> List[Dict]:
+    def parse_srt(srt_file: str, start_time: float = None, end_time: float = None) -> List[Dict]:
         """
         解析 SRT 字幕文件
+        
+        Args:
+            srt_file: SRT文件路径
+            start_time: 起始时间（秒），只解析此时间之后的字幕
+            end_time: 结束时间（秒），只解析此时间之前的字幕
         
         Returns:
             字幕列表，每个字幕包含 index, start_time, end_time, text
         """
         subtitles = []
         
-        with open(srt_file, 'r', encoding='utf-8') as f:
+        with open(srt_file, 'r', encoding='utf-8-sig') as f:  # utf-8-sig 自动去除BOM
             content = f.read()
         
         # 分割每个字幕块
@@ -47,13 +52,19 @@ class SRTParser:
                     start_h, start_m, start_s, start_ms = map(int, match.groups()[:4])
                     end_h, end_m, end_s, end_ms = map(int, match.groups()[4:])
                     
-                    start_time = start_h * 3600 + start_m * 60 + start_s + start_ms / 1000
-                    end_time = end_h * 3600 + end_m * 60 + end_s + end_ms / 1000
+                    sub_start_time = start_h * 3600 + start_m * 60 + start_s + start_ms / 1000
+                    sub_end_time = end_h * 3600 + end_m * 60 + end_s + end_ms / 1000
+                    
+                    # 过滤时间范围
+                    if start_time is not None and sub_end_time < start_time:
+                        continue
+                    if end_time is not None and sub_start_time > end_time:
+                        continue
                     
                     subtitles.append({
                         'index': index,
-                        'start_time': start_time,
-                        'end_time': end_time,
+                        'start_time': sub_start_time,
+                        'end_time': sub_end_time,
                         'text': text
                     })
             except Exception as e:
@@ -123,6 +134,8 @@ class ScriptGenerator:
 8. **关键要求：每段文案必须包含对应字幕行中的关键词、人名、对话或场景**
 9. 解说可以润色、总结、扩展，但核心关键词必须来自字幕原文
 10. 这样LLM才能通过关键词匹配到正确的视频片段
+11. ⚠️ **跳过片头旁白和歌词**：如果字幕包含动漫片头旁白（如「我是XX，身体虽小...真相永远只有一个」）或歌词，必须跳过这些行号，从正片剧情内容开始创作文案
+12. ⚠️ **不要使用歌词或片头旁白内容**：文案中不能出现歌词或片头固定台词
 """
         
         if theme:
@@ -217,6 +230,18 @@ def main():
         help="DeepSeek API 密钥（可从环境变量 DEEPSEEK_API_KEY 读取）"
     )
     
+    parser.add_argument(
+        "--start",
+        type=float,
+        help="起始时间（秒），只处理此时间之后的字幕"
+    )
+    
+    parser.add_argument(
+        "--end",
+        type=float,
+        help="结束时间（秒），只处理此时间之前的字幕"
+    )
+    
     args = parser.parse_args()
     
     # 检查文件存在
@@ -241,8 +266,11 @@ def main():
     
     # 解析 SRT
     print("\n📄 解析 SRT 字幕...")
+    if args.start or args.end:
+        time_range = f" (时间范围: {args.start or 0}s - {args.end or '结束'}s)"
+        print(f"   {time_range}")
     parser_obj = SRTParser()
-    subtitles = parser_obj.parse_srt(args.srt_file)
+    subtitles = parser_obj.parse_srt(args.srt_file, start_time=args.start, end_time=args.end)
     print(f"✅ 共解析 {len(subtitles)} 条字幕\n")
     
     # 格式化为 LLM 输入
