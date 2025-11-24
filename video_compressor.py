@@ -149,8 +149,20 @@ class VideoClipFinder:
   "end_time": <结束时间（秒）>,
   "duration": <实际时长（秒）>,
   "confidence": <匹配度 0-1>,
-  "reason": "<选择理由>"
-}}"""
+  "quality_score": <质量评分 0-100>,
+  "match_level": "<匹配等级: excellent|good|acceptable|poor|none>",
+  "reason": "<选择理由>",
+  "content_match": "<内容匹配说明>",
+  "issues": ["<可能存在的问题列表>"]
+}}
+
+评分标准:
+- excellent (90-100): 内容高度相关，画面精彩，时长完美
+- good (70-89): 内容相关，画面合适，时长符合
+- acceptable (50-69): 内容部分相关或时长稍有出入
+- poor (30-49): 内容勉强相关或存在明显问题
+- none (0-29): 几乎无相关内容或无法匹配
+"""
         
         try:
             response = self.client.chat.completions.create(
@@ -185,10 +197,34 @@ class VideoClipFinder:
             # 验证时间区间
             result = self._validate_clip_duration(result, duration, range_subs)
             
-            print(f"  ✓ LLM 选择: 行 {result['start_line']}-{result['end_line']}, "
+            # 获取质量评分和匹配等级
+            quality_score = result.get('quality_score', 50)
+            match_level = result.get('match_level', 'acceptable')
+            
+            # 根据匹配等级显示不同颜色的提示
+            if match_level == 'excellent':
+                level_icon = "\033[32m✓ 优秀\033[0m"  # 绿色
+            elif match_level == 'good':
+                level_icon = "\033[36m✓ 良好\033[0m"  # 青色
+            elif match_level == 'acceptable':
+                level_icon = "\033[33m⚠ 可接受\033[0m"  # 黄色
+            elif match_level == 'poor':
+                level_icon = "\033[33m⚠ 质量较差\033[0m"  # 橙色(用黄色代替)
+            else:  # none
+                level_icon = "\033[31m✗ 无匹配\033[0m"  # 红色
+            
+            print(f"  {level_icon} LLM 选择: 行 {result['start_line']}-{result['end_line']}, "
                   f"时间 {result['start_time']:.2f}s-{result['end_time']:.2f}s, "
-                  f"时长 {result['duration']:.2f}s, 匹配度: {result.get('confidence', 0):.2f}")
-            print(f"    理由: {result.get('reason', 'N/A')}")
+                  f"时长 {result['duration']:.2f}s")
+            print(f"    评分: {quality_score}/100 | 匹配度: {result.get('confidence', 0):.2f}")
+            print(f"    内容: {result.get('content_match', result.get('reason', 'N/A'))}")
+            
+            # 显示可能的问题
+            issues = result.get('issues', [])
+            if issues and isinstance(issues, list) and len(issues) > 0:
+                for issue in issues:
+                    if issue and issue.strip():
+                        print(f"    \033[33m⚠\033[0m {issue}")
             
             return result
             
@@ -212,7 +248,11 @@ class VideoClipFinder:
                         'end_time': selected_subs[-1]['end_time'],
                         'duration': selected_subs[-1]['end_time'] - selected_subs[0]['start_time'],
                         'confidence': 0.5,
-                        'reason': '降级策略：自动选择'
+                        'quality_score': 40,
+                        'match_level': 'poor',
+                        'reason': '降级策略：自动选择',
+                        'content_match': 'LLM失败，使用自动选择策略',
+                        'issues': ['LLM查询失败，无法评估匹配质量']
                     }
             return None
     

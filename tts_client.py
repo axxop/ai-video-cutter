@@ -42,6 +42,7 @@ class CosyVoiceClient:
         text: str,
         output_file: Optional[str] = None,
         speaker_id: Optional[str] = None,
+        speed: Optional[float] = None,
     ) -> dict:
         """
         将文本转换为语音
@@ -58,9 +59,10 @@ class CosyVoiceClient:
             raise ValueError("Text cannot be empty")
         
         speaker_id = speaker_id or self.config.speaker_id
+        speed = speed if speed is not None else self.config.tts_params.get('speed', 1.0)
         
         try:
-            logger.info(f"正在合成语音: {speaker_id} | 文本长度: {len(text)} 字")
+            logger.info(f"正在合成语音: {speaker_id} | 文本长度: {len(text)} 字 | 语速: {speed}x")
             
             # 创建合成器
             synthesizer = SpeechSynthesizer(
@@ -68,6 +70,7 @@ class CosyVoiceClient:
                 # voice='longhua_v2',  # 标准女声
                 voice='longbaizhi',  # 标准女声
                 format=AudioFormat.WAV_22050HZ_MONO_16BIT,
+                speech_rate=speed,  # 设置语速 (0.5-2.0)
             )
             
             # 调用合成 (同步)
@@ -111,6 +114,7 @@ class CosyVoiceClient:
         texts: list,
         output_dir: Optional[str] = None,
         speaker_id: Optional[str] = None,
+        speed: Optional[float] = None,
     ) -> list:
         """
         批量文本转语音
@@ -137,7 +141,7 @@ class CosyVoiceClient:
                     text = item
                     output_file = None
                 
-                result = self.synthesize(text, output_file, speaker_id)
+                result = self.synthesize(text, output_file, speaker_id, speed)
                 results.append(result)
                 logger.info(f"[{i}/{len(texts)}] ✓ 完成")
             
@@ -159,6 +163,7 @@ def tts(
     speaker: str = "龙白芷",
     api_key: Optional[str] = None,
     output_file: Optional[str] = None,
+    speed: float = 1.2,
 ) -> str:
     """
     快速 TTS 函数
@@ -172,10 +177,10 @@ def tts(
     Returns:
         输出文件路径
     """
-    api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
+    api_key = api_key or os.getenv("DASHSCOPE_API_KEY") or os.getenv("BAILIAN_API_KEY") or "sk-f0b5e3f543d64b0d8640888cb4327b74"
     config = CosyVoiceConfig(api_key=api_key, speaker_id=speaker)
     client = CosyVoiceClient(config)
-    result = client.synthesize(text, output_file)
+    result = client.synthesize(text, output_file, speed=speed)
     
     if result["status"] == "success":
         return result["output_file"]

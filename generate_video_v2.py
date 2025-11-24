@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-完整视频生成流程：
-1. 解析文案脚本（带行号范围）
+完整视频生成流程 V2：支持V2格式文案（连续文本+嵌入行号标记）
+1. 解析 V2 格式文案（文本内容[行号]...）
 2. 并行生成 TTS 配音（缓存）
 3. 并行调用 DeepSeek 细化视频片段选择（缓存）
 4. 并行提取视频片段并添加配音+字幕（缓存）
@@ -78,41 +78,92 @@ class CacheManager:
         self.__init__(str(self.cache_dir))
 
 
-class ScriptParser:
-    """文案脚本解析器"""
+class ScriptParserV2:
+    """V2 文案脚本解析器 - 支持连续文本+嵌入行号标记
+    
+    格式: 连续文本内容[行号范围]更多文本[行号范围]...
+    示例: 怪盗基德[11-15]发出预告信，要偷斧江家[16-20]的两把肋差刀[21-25]...
+    """
     
     @staticmethod
-    def parse_script_file(script_file: str) -> List[Dict]:
+    def parse_script_file(script_file: str, chunk_words: int = 30) -> List[Dict]:
         """
-        解析文案脚本文件
-        格式: [时间] [行号] 内容
+        解析 V2 格式文案脚本文件
         
+        Args:
+            script_file: 文案文件路径
+            chunk_words: 每个片段的字数（默认30字，约6-8秒TTS）
+            
         Returns:
-            [{'duration': 15, 'line_range': [1, 50], 'text': '...'}]
+            [{'text': '...', 'line_ranges': [[1,5], [6,10]], 'keywords': [...]}]
         """
-        segments = []
-        
         with open(script_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                # 解析格式: [15s] [1-50] 内容...
-                match = re.match(r'\[(\d+)s\]\s*\[(\d+)-(\d+)\]\s*(.+)', line)
-                if match:
-                    duration = int(match.group(1))
-                    line_start = int(match.group(2))
-                    line_end = int(match.group(3))
-                    text = match.group(4)
-                    
+            content = f.read().strip()
+        
+        # 提取所有关键词和行号标记
+        # 格式: 关键词[行号范围]
+        pattern = r'([^[\]]+?)\[(\d+)-(\d+)\]'
+        
+        # 先将文本分割成带行号标记的片段
+        annotated_segments = []
+        pos = 0
+        
+        for match in re.finditer(pattern, content):
+            keyword = match.group(1).strip()
+            line_start = int(match.group(2))
+            line_end = int(match.group(3))
+            
+            # 添加关键词段落
+            if keyword:
+                annotated_segments.append({
+                    'text': keyword,
+                    'line_range': [line_start, line_end],
+                    'is_keyword': True
+                })
+            
+            pos = match.end()
+        
+        # 按字数切分成小片段
+        segments = []
+        current_text = ""
+        current_line_ranges = []
+        current_keywords = []
+        
+        for seg in annotated_segments:
+            # 添加关键词到当前片段
+            current_text += seg['text']
+            current_line_ranges.append(seg['line_range'])
+            current_keywords.append(seg['text'])
+            
+            # 如果达到字数限制，创建新片段
+            if len(current_text) >= chunk_words:
+                if current_text.strip():
                     segments.append({
-                        'duration': duration,
-                        'line_range': [line_start, line_end],
-                        'text': text
+                        'text': current_text.strip(),
+                        'line_ranges': current_line_ranges.copy(),
+                        'keywords': current_keywords.copy(),
+                        'line_range': [
+                            min(r[0] for r in current_line_ranges),
+                            max(r[1] for r in current_line_ranges)
+                        ]
                     })
-                else:
-                    print(f"⚠️  无法解析行: {line[:60]}...")
+                
+                # 重置
+                current_text = ""
+                current_line_ranges = []
+                current_keywords = []
+        
+        # 添加最后一个片段
+        if current_text.strip():
+            segments.append({
+                'text': current_text.strip(),
+                'line_ranges': current_line_ranges.copy(),
+                'keywords': current_keywords.copy(),
+                'line_range': [
+                    min(r[0] for r in current_line_ranges),
+                    max(r[1] for r in current_line_ranges)
+                ]
+            })
         
         return segments
 
@@ -145,7 +196,6 @@ class ParallelTTSGenerator:
     def generate_one(self, segment: Dict, index: int) -> Dict:
         """生成单个 TTS 音频（带缓存）"""
         text = segment['text']
-        duration = segment['duration']
         
         # 检查缓存
         cache_path = self.cache_manager.get_tts_cache_path(text, self.speaker_id)
@@ -156,7 +206,6 @@ class ParallelTTSGenerator:
                 'index': index,
                 'audio_file': str(cache_path),
                 'text': text,
-                'duration': duration,
                 'line_range': segment['line_range'],
                 'from_cache': True
             }
@@ -170,7 +219,6 @@ class ParallelTTSGenerator:
                 'index': index,
                 'audio_file': str(cache_path),
                 'text': text,
-                'duration': duration,
                 'line_range': segment['line_range'],
                 'from_cache': False
             }
@@ -222,11 +270,10 @@ class ParallelClipSelector:
         使用 DeepSeek 在指定行号范围内细化选择
         """
         text = segment['text']
-        audio_duration = segment['duration']
         line_start, line_end = segment['line_range']
         
-        # 生成缓存键
-        cache_key = f"{line_start}-{line_end}:{text}:{audio_duration}"
+        # 生成缓存键（V2不依赖固定duration）
+        cache_key = f"v2:{line_start}-{line_end}:{text}"
         cache_path = self.cache_manager.get_meta_cache_path("clip_selection", cache_key)
         
         # 检查缓存
@@ -240,17 +287,39 @@ class ParallelClipSelector:
         print(f"  [{index}] 🤖 DeepSeek 选择片段: [{line_start}-{line_end}] {text[:40]}...")
         
         clip_info = self.clip_finder.find_best_clip(
-            text, self.subtitles, line_start, line_end, audio_duration
+            text, self.subtitles, line_start, line_end, target_duration=None  # V2不指定时长
         )
         
         if not clip_info:
             print(f"  [{index}] \033[31m✗ 无匹配\033[0m 未找到合适片段")
             return None
         
+        # 显示质量评分
+        quality_score = clip_info.get('quality_score', 0)
+        match_level = clip_info.get('match_level', 'none')
+        
+        # 根据质量等级显示不同颜色
+        if match_level == 'excellent':
+            color = '\033[32m'  # 绿色
+            icon = '✓ 优秀'
+        elif match_level == 'good':
+            color = '\033[36m'  # 青色
+            icon = '✓ 良好'
+        elif match_level == 'acceptable':
+            color = '\033[33m'  # 黄色
+            icon = '⚠ 可接受'
+        elif match_level == 'poor':
+            color = '\033[38;5;208m'  # 橙色
+            icon = '⚠ 质量较差'
+        else:
+            color = '\033[31m'  # 红色
+            icon = '✗ 无匹配'
+        
+        print(f"  [{index}] {color}{icon}\033[0m 质量评分: {quality_score}/100")
+        
         # 添加元数据
         clip_info['index'] = index
         clip_info['text'] = text
-        clip_info['audio_duration'] = audio_duration
         
         # 保存缓存
         self.cache_manager.save_json(cache_path, clip_info)
@@ -299,7 +368,6 @@ class ParallelVideoClipper:
         start_time = clip_info['start_time']
         end_time = clip_info['end_time']
         text = clip_info['text']
-        audio_duration = clip_info['audio_duration']
         
         # 计算实际视频片段时长
         duration = end_time - start_time
@@ -469,14 +537,16 @@ class VideoComposer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='完整视频生成流程：文案 → TTS → 片段选择 → 视频合成'
+        description='完整视频生成流程 V2：支持连续文案+嵌入行号标记'
     )
     
-    parser.add_argument('script_file', help='文案脚本文件（格式: [时间] [行号] 内容）')
+    parser.add_argument('script_file', help='V2文案脚本文件（格式: 文本[行号]文本[行号]...）')
     parser.add_argument('srt_file', help='原始字幕文件（SRT 格式）')
     parser.add_argument('video_file', help='原始视频文件')
-    parser.add_argument('-o', '--output', default='final_output.mp4', help='输出视频文件')
+    parser.add_argument('-o', '--output', default='final_output_v2.mp4', help='输出视频文件')
     
+    parser.add_argument('--chunk-words', type=int, default=30, 
+                       help='每个片段的字数（默认30字，约6-8秒TTS）')
     parser.add_argument('--speaker', default='龙白芷', help='TTS 语音角色（默认: 龙白芷）')
     parser.add_argument('--tts-workers', type=int, default=4, help='TTS 并发数（默认: 4）')
     parser.add_argument('--clip-workers', type=int, default=3, help='片段选择并发数（默认: 3）')
@@ -488,12 +558,13 @@ def main():
     args = parser.parse_args()
     
     print("=" * 80)
-    print("完整视频生成流程")
+    print("完整视频生成流程 V2 (连续文案+嵌入行号)")
     print("=" * 80)
     print(f"文案脚本: {args.script_file}")
     print(f"原始字幕: {args.srt_file}")
     print(f"原始视频: {args.video_file}")
     print(f"输出文件: {args.output}")
+    print(f"片段字数: {args.chunk_words} 字/片段")
     print(f"TTS 并发数: {args.tts_workers}")
     print(f"片段选择并发数: {args.clip_workers}")
     print(f"视频提取并发数: {args.video_workers}")
@@ -507,10 +578,18 @@ def main():
         cache_manager.clear()
         print("✅ 缓存已清理\n")
     
-    # Step 1: 解析文案脚本
-    print("\n📄 Step 1: 解析文案脚本...")
-    segments = ScriptParser.parse_script_file(args.script_file)
-    print(f"✅ 共解析 {len(segments)} 个段落\n")
+    # Step 1: 解析 V2 格式文案脚本
+    print("\n📄 Step 1: 解析 V2 格式文案脚本...")
+    segments = ScriptParserV2.parse_script_file(args.script_file, args.chunk_words)
+    print(f"✅ 共解析 {len(segments)} 个片段\n")
+    
+    # 显示前3个片段预览
+    print("预览前3个片段:")
+    for i, seg in enumerate(segments[:3], 1):
+        print(f"  [{i}] {seg['text'][:50]}... (行号: {seg['line_range']})")
+    if len(segments) > 3:
+        print(f"  ... 还有 {len(segments) - 3} 个片段")
+    print()
     
     # Step 2: 解析原始字幕
     print("📄 Step 2: 解析原始字幕...")
@@ -582,7 +661,10 @@ def main():
     print(f"{'='*80}\n")
     
     # Step 4: 合成最终视频
-    VideoComposer.compose(video_clips, args.output)
+    if video_clips:
+        VideoComposer.compose(video_clips, args.output)
+    else:
+        print("❌ 没有成功生成任何视频片段，无法合成最终视频")
     
     print("=" * 80)
     print("✅ 全部完成！")
